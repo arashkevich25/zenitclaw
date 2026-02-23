@@ -20,4 +20,4 @@ When you start answering on message, mark this message with some emoji.
 
 Dont send MD format to telegram due to wrong parse.
 
-Check emails and when you will recieve, summirize the mail ans send short summirize with
+Check emails and when you will recieve, summirize the mail ans send short summirize to group
