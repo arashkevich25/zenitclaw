@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.7
-# ZeroClaw – Gemini provider variant
+# ZeroClaw – Ollama provider variant
 # Built from the Homebrew formula source tarball — no local repo clone required.
 #
 # Build:
-#   docker build -t neuron-zeroclaw-gemini .
+#   docker build -t neuron-zeroclaw-ollama .
 #
 # Run:
 #   docker run -d \
@@ -11,9 +11,10 @@
 #     -p 42617:42617 \
 #     -v zeroclaw_data:/zeroclaw-data \
 #     -e TELEGRAM_BOT_TOKEN=123456:ABC... \
-#     -e GEMINI_API_KEY=your-gemini-key \
+#     -e OLLAMA_BASE_URL=http://your-ollama-server:11434 \
+#     -e OLLAMA_API_KEY=your-ollama-api-key \
 #     -e BRAVE_API_KEY=your-brave-key \
-#     neuron-zeroclaw-gemini
+#     neuron-zeroclaw-ollama
 #
 # First run: the bot logs a /bind <code> pairing code.
 # Send that command to the bot in Telegram to whitelist your user ID.
@@ -33,14 +34,14 @@ WORKDIR /build
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y \
-        curl \
-        pkg-config \
+    curl \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # Download the same tarball Homebrew uses, verify checksum, extract.
 RUN curl -fsSL \
-        "https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/v${ZEROCLAW_VERSION}.tar.gz" \
-        -o zeroclaw.tar.gz && \
+    "https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/v${ZEROCLAW_VERSION}.tar.gz" \
+    -o zeroclaw.tar.gz && \
     echo "${ZEROCLAW_SHA256}  zeroclaw.tar.gz" | sha256sum -c && \
     tar -xzf zeroclaw.tar.gz --strip-components=1 && \
     rm zeroclaw.tar.gz
@@ -78,20 +79,43 @@ set -e
 CONFIG=/zeroclaw-data/.zeroclaw/config.toml
 mkdir -p "$(dirname "$CONFIG")"
 
-# Preserve paired Telegram user IDs across restarts
+# Preserve paired Telegram user IDs across restarts.
+# allowed_users may be a multi-line TOML array after bind-telegram runs,
+# so read all lines from "allowed_users = [" until the closing "]".
 ALLOWED_USERS="[]"
 if [ -f "$CONFIG" ]; then
-    line=$(grep "^allowed_users = " "$CONFIG" 2>/dev/null || true)
-    [ -n "$line" ] && ALLOWED_USERS="${line#allowed_users = }"
+    ALLOWED_USERS=$(awk '
+        /^allowed_users = / {
+            val = substr($0, index($0, "= ") + 2)
+            if (val ~ /\]/) { print val; exit }
+            while ((getline l) > 0) {
+                val = val "\n" l
+                if (l ~ /^\]/) { print val; exit }
+            }
+        }' "$CONFIG" 2>/dev/null)
+    [ -z "$ALLOWED_USERS" ] && ALLOWED_USERS="[]"
 fi
 
-# Generate a proper full config via zeroclaw's own onboard command.
-# ZEROCLAW_CONFIG_DIR is already set so it writes to the right place.
-zeroclaw onboard --provider gemini --model gemini-2.5-flash --force
+# Run onboard with ZEROCLAW_MODEL unset so the env var does not override
+# --model llama3.2 and trigger the ':cloud' remote-endpoint validation before
+# we have a chance to inject api_url.
+env -u ZEROCLAW_MODEL zeroclaw onboard --provider ollama --model llama3.2 --force
 
-# Inject API keys — onboard leaves them blank; zeroclaw reads from config, not env.
-if [ -n "$GEMINI_API_KEY" ]; then
-    sed -i "s|^api_key = .*|api_key = \"$GEMINI_API_KEY\"|" "$CONFIG"
+# Inject top-level api_url for the remote Ollama endpoint.
+# api_url also exists inside [transcription], so we cannot use grep/sed to find
+# "any api_url line" — we must always prepend at the top of the file.
+if [ -n "$OLLAMA_BASE_URL" ]; then
+    { printf 'api_url = "%s"\n' "$OLLAMA_BASE_URL"; cat "$CONFIG"; } > /tmp/cfg_tmp
+    cp /tmp/cfg_tmp "$CONFIG"
+    rm /tmp/cfg_tmp
+fi
+
+# Patch default_model to the cloud model now that api_url is in place.
+_model="${ZEROCLAW_MODEL:-kimi-k2.5:cloud}"
+if grep -q '^default_model = ' "$CONFIG"; then
+    sed -i "s|^default_model = .*|default_model = \"$_model\"|" "$CONFIG"
+else
+    printf 'default_model = "%s"\n' "$_model" >> "$CONFIG"
 fi
 if [ -n "$BRAVE_API_KEY" ]; then
     sed -i "s|^brave_api_key = .*|brave_api_key = \"$BRAVE_API_KEY\"|" "$CONFIG"
@@ -113,6 +137,23 @@ bot_token = "$TELEGRAM_BOT_TOKEN"
 allowed_users = $ALLOWED_USERS
 EOF
 
+# Append Gmail channel if credentials are provided.
+if [ -n "$GMAIL_ADDRESS" ] && [ -n "$GMAIL_APP_PASSWORD" ]; then
+cat >> "$CONFIG" <<EOF
+
+[channels_config.email]
+imap_host = "imap.gmail.com"
+imap_port = 993
+smtp_host = "smtp.gmail.com"
+smtp_port = 465
+smtp_tls = true
+username = "$GMAIL_ADDRESS"
+password = "$GMAIL_APP_PASSWORD"
+from_address = "$GMAIL_ADDRESS"
+allowed_senders = ["*"]
+EOF
+fi
+
 exec zeroclaw "$@"
 SCRIPT
 RUN chmod +x /entrypoint.sh && chown 65534:65534 /entrypoint.sh
@@ -120,11 +161,11 @@ RUN chmod +x /entrypoint.sh && chown 65534:65534 /entrypoint.sh
 ENV HOME=/zeroclaw-data
 # Pin config dir — highest-priority, bypasses all workspace-based path resolution
 ENV ZEROCLAW_CONFIG_DIR=/zeroclaw-data/.zeroclaw
-ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
+ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/.zeroclaw/workspace
 # PROVIDER is the canonical env var (ZEROCLAW_PROVIDER kept for compatibility)
-ENV PROVIDER="gemini"
-ENV ZEROCLAW_PROVIDER="gemini"
-ENV ZEROCLAW_MODEL="gemini-2.5-flash"
+ENV PROVIDER="ollama"
+ENV ZEROCLAW_PROVIDER="ollama"
+ENV ZEROCLAW_MODEL="kimi-k2.5:cloud"
 ENV ZEROCLAW_GATEWAY_PORT=42617
 ENV ZEROCLAW_ALLOW_PUBLIC_BIND=true
 ENV WEB_SEARCH_ENABLED=true
@@ -132,7 +173,7 @@ ENV WEB_SEARCH_PROVIDER="brave"
 
 # Secrets must be injected at runtime — never bake them into the image.
 # Required:  TELEGRAM_BOT_TOKEN
-# Optional:  GEMINI_API_KEY, BRAVE_API_KEY
+# Optional:  OLLAMA_BASE_URL, OLLAMA_API_KEY, BRAVE_API_KEY, GMAIL_ADDRESS, GMAIL_APP_PASSWORD
 
 WORKDIR /zeroclaw-data
 USER 65534:65534
